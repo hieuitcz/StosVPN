@@ -1,0 +1,104 @@
+name: Build IPA with Fake Signing fix
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+jobs:
+    build:
+        runs-on: macos-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Install ldid
+              run: brew install ldid
+
+            - name: List available Xcode versions
+              run: ls /Applications/ | grep Xcode
+
+            - name: Select Xcode version
+              run: |
+                  # Find latest Xcode 16.x
+                  XCODE_PATH=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | tail -n 1)
+                  if [ -z "$XCODE_PATH" ]; then
+                    echo "Xcode 16 not found, using default"
+                    XCODE_PATH="/Applications/Xcode.app"
+                  fi
+                  echo "Using Xcode at: $XCODE_PATH"
+                  sudo xcode-select -s "$XCODE_PATH"
+                  xcodebuild -version
+
+            - name: Build Xcode Archive
+              run: |
+                  xcodebuild archive \
+                    -project StosVPN.xcodeproj \
+                    -scheme StosVPN \
+                    -destination 'generic/platform=iOS' \
+                    -archivePath build/StosVPN.xcarchive \
+                    CODE_SIGN_IDENTITY="" \
+                    CODE_SIGNING_REQUIRED=NO \
+                    CODE_SIGNING_ALLOWED=NO \
+                    CODE_SIGN_ENTITLEMENTS="" \
+                    DEVELOPMENT_TEAM=""
+
+            - name: Create Payload directory
+              run: mkdir -p Payload
+
+            - name: Copy App to Payload
+              run: cp -R build/StosVPN.xcarchive/Products/Applications/StosVPN.app Payload/
+
+            - name: Find and Sign App Extension
+              run: |
+                  APPEX_PATH=$(find Payload/StosVPN.app/PlugIns -name "*.appex" | head -n 1)
+                  if [ -z "$APPEX_PATH" ]; then
+                    echo "Warning: App Extension (.appex) not found in PlugIns directory."
+                    echo "This may be normal if the app has no extensions."
+                  else
+                    echo "Found App Extension at: $APPEX_PATH"
+                    APPEX_NAME=$(basename "$APPEX_PATH" .appex)
+                    # Get the actual binary name from Info.plist
+                    BINARY_NAME=$(defaults read "$APPEX_PATH/Info.plist" CFBundleExecutable 2>/dev/null || echo "$APPEX_NAME")
+                    BINARY_PATH="$APPEX_PATH/$BINARY_NAME"
+                    
+                    if [ -f "$BINARY_PATH" ]; then
+                      echo "Signing binary at: $BINARY_PATH"
+                      if [ -f "${GITHUB_WORKSPACE}/TunnelProv/TunnelProv.entitlements" ]; then
+                        ldid -S"${GITHUB_WORKSPACE}/TunnelProv/TunnelProv.entitlements" "$BINARY_PATH"
+                      else
+                        echo "Entitlements file not found, signing without entitlements"
+                        ldid -S "$BINARY_PATH"
+                      fi
+                      echo "Signed App Extension."
+                    else
+                      echo "Error: Binary not found at $BINARY_PATH"
+                      exit 1
+                    fi
+                  fi
+
+            - name: Sign Main App Bundle
+              run: |
+                  APP_BINARY_PATH="Payload/StosVPN.app/StosVPN"
+                  if [ ! -f "$APP_BINARY_PATH" ]; then
+                    echo "Error: Main app binary not found at $APP_BINARY_PATH"
+                    exit 1
+                  fi
+                  
+                  if [ -f "${GITHUB_WORKSPACE}/StosVPN/StosVPN.entitlements" ]; then
+                    ldid -S"${GITHUB_WORKSPACE}/StosVPN/StosVPN.entitlements" "$APP_BINARY_PATH"
+                  else
+                    echo "Entitlements file not found, signing without entitlements"
+                    ldid -S "$APP_BINARY_PATH"
+                  fi
+                  echo "Signed Main App Bundle."
+
+            - name: Create IPA
+              run: zip -r ./StosVPN-fakesigned.ipa Payload
+
+            - name: Upload IPA Artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: StosVPN-fakesigned
+                  path: StosVPN-fakesigned.ipa
